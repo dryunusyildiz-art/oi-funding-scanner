@@ -1,8 +1,17 @@
-name: oi-funding-scanner
+name: spot-scanner
 
 # =============================================================================
 #  GitHub Actions ile UCRETSIZ tarama (PC/sunucu gerekmez)
 #  Bu dosyanin repodaki yolu:  .github/workflows/scanner.yml
+#
+#  main.py (futures OI+funding) Binance fapi'nin GitHub Actions IP'lerini
+#  HTTP 451 ile engellemesi yuzunden burada CALISTIRILAMIYOR (bkz.
+#  DEPLOYMENT_REHBERI.md). Bunun yerine main_spot.py (hacim-rejimi + taker-
+#  buy-ratio proxy'li spot-uyarlamasi) calistirilir; data-api.binance.vision
+#  mirror'i sayesinde bulut IP'lerinden erisilebiliyor.
+#
+#  main.py futures botu hala senin kendi PC'nde/agindan calisiyor (Binance
+#  orayi engellemiyor) -- iki bot birbirinden bagimsiz, paralel calisir.
 #
 #  Tetikleme: cron-job.org, asagidaki URL'e duzenli araliklarla POST atarak
 #  bu workflow'u calistirir (workflow_dispatch). GitHub'in kendi "schedule:"
@@ -14,13 +23,11 @@ name: oi-funding-scanner
 
 on:
   workflow_dispatch:      # cron-job.org (ve istersen Actions sekmesinden elle) bunu tetikler
-  # NOT: Public repoda GitHub Actions ucretsiz/sinirsizdir; bu bot her
-  # calismada tek bir tarama turu yapip (main.py --once) biter.
 
 # Ayni anda tek calisma olsun (cron-job.org bir onceki tur bitmeden yeni
 # istek atarsa, yenisi kuyruga girer/iptal olmaz, cakismaz)
 concurrency:
-  group: oi-funding-scanner
+  group: spot-scanner
   cancel-in-progress: false
 
 jobs:
@@ -47,32 +54,33 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            oi_funding_alerts_cache.json
-            virtual_trades.json
-          key: scanner-state-${{ github.run_id }}
+            spot_alerts_cache.json
+            spot_virtual_trades.json
+          key: spot-scanner-state-${{ github.run_id }}
           restore-keys: |
-            scanner-state-
+            spot-scanner-state-
 
-      - name: Taramayi calistir (tek tur)
+      - name: Taramayi calistir (tek tur, spot)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_ENABLED: "true"
           EXCHANGE_NAME: "binance"
+          USE_BINANCE_DATA_MIRROR: "true"
           TIMEFRAMES: "1h,4h"
-          OI_SPIKE_STRONG: "3.0"
-          OI_SPIKE_WATCH: "1.5"
-          OI_WINDOW_STRONG: "8.0"
-          OI_WINDOW_WATCH: "4.0"
-          OI_WINDOW: "6"
-          FUNDING_EXTREME: "0.05"
-          FUNDING_MODERATE: "0.02"
+          VOLUME_SPIKE_STRONG: "40.0"
+          VOLUME_SPIKE_WATCH: "20.0"
+          VOLUME_WINDOW_STRONG: "60.0"
+          VOLUME_WINDOW_WATCH: "30.0"
+          VOLUME_WINDOW: "6"
+          TAKER_RATIO_EXTREME: "0.15"
+          TAKER_RATIO_MODERATE: "0.07"
           MIN_SCORE_STRONG: "75"
           MIN_SCORE_WATCH: "60"
           ALERT_COOLDOWN_MINUTES: "90"
           MAX_CONCURRENCY: "10"
           SSL_VERIFY: "true"
-        run: python main.py --once
+        run: python main_spot.py --once
 
       # actions/cache save adimi is basarili bitince OTOMATIK calisir
       # (yukaridaki restore adimindan gelen ayni "path" icin); ekstra bir

@@ -1,0 +1,79 @@
+name: oi-funding-scanner
+
+# =============================================================================
+#  GitHub Actions ile UCRETSIZ tarama (PC/sunucu gerekmez)
+#  Bu dosyanin repodaki yolu:  .github/workflows/scanner.yml
+#
+#  Tetikleme: cron-job.org, asagidaki URL'e duzenli araliklarla POST atarak
+#  bu workflow'u calistirir (workflow_dispatch). GitHub'in kendi "schedule:"
+#  cron'u KULLANILMIYOR - zamanlama tamamen cron-job.org tarafinda.
+#    POST https://api.github.com/repos/<KULLANICI>/<REPO>/actions/workflows/scanner.yml/dispatches
+#    Body: {"ref":"main"}
+#  (Detaylar: DEPLOYMENT_REHBERI.md)
+# =============================================================================
+
+on:
+  workflow_dispatch:      # cron-job.org (ve istersen Actions sekmesinden elle) bunu tetikler
+  # NOT: Public repoda GitHub Actions ucretsiz/sinirsizdir; bu bot her
+  # calismada tek bir tarama turu yapip (main.py --once) biter.
+
+# Ayni anda tek calisma olsun (cron-job.org bir onceki tur bitmeden yeni
+# istek atarsa, yenisi kuyruga girer/iptal olmaz, cakismaz)
+concurrency:
+  group: oi-funding-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Bagimliliklari yukle
+        run: pip install -r requirements.txt
+
+      # Cooldown (alarm tekrari onleme) ve sanal performans durumunu
+      # calismalar arasi tasi -> ayni sinyal her turda tekrar tekrar
+      # gonderilmesin, --perf gecmisi birikmeye devam etsin.
+      - name: Onceki durumu geri yukle (cooldown + performans)
+        uses: actions/cache@v4
+        with:
+          path: |
+            oi_funding_alerts_cache.json
+            virtual_trades.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+
+      - name: Taramayi calistir (tek tur)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ENABLED: "true"
+          EXCHANGE_NAME: "binance"
+          TIMEFRAMES: "1h,4h"
+          OI_SPIKE_STRONG: "3.0"
+          OI_SPIKE_WATCH: "1.5"
+          OI_WINDOW_STRONG: "8.0"
+          OI_WINDOW_WATCH: "4.0"
+          OI_WINDOW: "6"
+          FUNDING_EXTREME: "0.05"
+          FUNDING_MODERATE: "0.02"
+          MIN_SCORE_STRONG: "75"
+          MIN_SCORE_WATCH: "60"
+          ALERT_COOLDOWN_MINUTES: "90"
+          MAX_CONCURRENCY: "10"
+          SSL_VERIFY: "true"
+        run: python main.py --once
+
+      # actions/cache save adimi is basarili bitince OTOMATIK calisir
+      # (yukaridaki restore adimindan gelen ayni "path" icin); ekstra bir
+      # "save" step'ine gerek yok.

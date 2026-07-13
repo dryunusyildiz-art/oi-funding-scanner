@@ -63,6 +63,7 @@ Kullanim:
 from __future__ import annotations
 
 import os
+import io
 import sys
 import time
 import json
@@ -97,6 +98,15 @@ try:
     import requests  # type: ignore
 except Exception:  # pragma: no cover
     requests = None
+
+# matplotlib: Telegram'a gonderilen fiyat+kanal grafigi icin (main.py ile
+# ayni mantik). Yuklu degilse bot cokmez, foto yerine sade metne duser.
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # type: ignore
+except Exception:  # pragma: no cover
+    plt = None
 
 
 # ------------------------------------------------------------------------------
@@ -208,6 +218,15 @@ class Config:
     # --- Volatilite filtresi ---
     MIN_ATR_PCT: float = float(_env("MIN_ATR_PCT", "0.15"))
 
+    # --- 144 periodluk lineer regresyon kanali filtresi ---
+    # main.py ile ayni mantik: fiyat UST banda yakinken sadece SHORT, ALT
+    # banda yakinken sadece LONG sinyali dikkate alinir (kanal ici/swing
+    # trade R:R'i icin ters yonde sinyal bastirilir). Orta bolgede dokunulmaz.
+    CHANNEL_FILTER_ENABLED: bool = _env("CHANNEL_FILTER_ENABLED", "true").lower() == "true"
+    CHANNEL_PERIOD: int = int(_env("CHANNEL_PERIOD", "144"))
+    CHANNEL_STDEV_MULT: float = float(_env("CHANNEL_STDEV_MULT", "2.0"))
+    CHANNEL_EDGE_ZONE: float = float(_env("CHANNEL_EDGE_ZONE", "0.15"))
+
     # --- Coklu zaman dilimi confluence ---
     CONFLUENCE_BONUS: float = float(_env("CONFLUENCE_BONUS", "8"))
     CONFLUENCE_PENALTY: float = float(_env("CONFLUENCE_PENALTY", "12"))
@@ -260,6 +279,7 @@ SYMBOLS = [
 
 STORAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spot_alerts_cache.json")
 PERF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spot_virtual_trades.json")
+ALERT_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spot_alert_log.json")
 
 
 # ==============================================================================
@@ -315,6 +335,28 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     out = 100.0 - (100.0 / (1.0 + rs))
     return out.fillna(100.0)
+
+
+def linreg_channel(close: pd.Series, period: int, stdev_mult: float) -> tuple[float, float, float, float]:
+    """Son `period` bar uzerinden lineer regresyon kanali.
+
+    Doner: (mid, upper, lower, channel_pos). channel_pos: 0.0 = alt bant,
+    1.0 = ust bant (kanal disinda <0/>1 olabilir). Yetersiz veri -> NaN.
+    """
+    if len(close) < period:
+        nan = float("nan")
+        return nan, nan, nan, nan
+    y = close.tail(period).to_numpy(dtype=float)
+    x = np.arange(period, dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+    fitted = slope * x + intercept
+    resid_std = float(np.std(y - fitted))
+    mid = float(fitted[-1])
+    upper = mid + stdev_mult * resid_std
+    lower = mid - stdev_mult * resid_std
+    price = float(y[-1])
+    channel_pos = (price - lower) / (upper - lower) if upper > lower else 0.5
+    return mid, upper, lower, channel_pos
 
 
 def wick_ratio(row: pd.Series) -> float:
@@ -373,6 +415,13 @@ class MarketSnapshot:
     ema20: float
     ema50: float
     last_wick_ratio: float
+    # 144 periodluk lineer regresyon kanali (yetersiz veri varsa NaN)
+    channel_mid: float = float("nan")
+    channel_upper: float = float("nan")
+    channel_lower: float = float("nan")
+    channel_pos: float = float("nan")
+    # kanal grafigi cizmek icin son CHANNEL_PERIOD kapanis fiyati (bellek-ici)
+    close_series: list = field(default_factory=list)
 
 
 @dataclass
@@ -617,6 +666,10 @@ def build_snapshot(cfg: Config, symbol: str, df: pd.DataFrame) -> MarketSnapshot
     ema50_now = float(ema(close, cfg.EMA_SLOW).iloc[-1])
     last_wick = wick_ratio(df.iloc[-1])
 
+    # --- 144 periodluk lineer regresyon kanali ---
+    ch_mid, ch_upper, ch_lower, ch_pos = linreg_channel(close, cfg.CHANNEL_PERIOD, cfg.CHANNEL_STDEV_MULT)
+    ch_closes = close.tail(cfg.CHANNEL_PERIOD).tolist() if len(close) >= cfg.CHANNEL_PERIOD else []
+
     return MarketSnapshot(
         symbol=symbol, price=price,
         price_chg_1=price_chg_1, price_chg_w=price_chg_w,
@@ -627,6 +680,8 @@ def build_snapshot(cfg: Config, symbol: str, df: pd.DataFrame) -> MarketSnapshot
         rsi=rsi_now, atr_pct=atrp,
         ema20=ema20_now, ema50=ema50_now,
         last_wick_ratio=last_wick,
+        channel_mid=ch_mid, channel_upper=ch_upper, channel_lower=ch_lower,
+        channel_pos=ch_pos, close_series=ch_closes,
     )
 
 
@@ -839,6 +894,31 @@ def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
 
 
 # ==============================================================================
+# 8b) 144 PERIODLUK REGRESYON KANALI FILTRESI (main.py ile ayni mantik)
+# ==============================================================================
+def apply_channel_filter(cfg: Config, sig: Signal) -> None:
+    """Fiyat UST banda yakinken LONG, ALT banda yakinken SHORT sinyalini
+    yerinde bastirir (sig.direction -> NEUTRAL). Bkz. main.py apply_channel_filter."""
+    if not cfg.CHANNEL_FILTER_ENABLED or sig.snap is None or sig.direction == "NEUTRAL":
+        return
+    pos = sig.snap.channel_pos
+    if math.isnan(pos):
+        return
+    if sig.direction == "LONG" and pos >= (1.0 - cfg.CHANNEL_EDGE_ZONE):
+        sig.warnings.append(
+            f"144-periyot kanalda UST banda yakin (poz {pos:.2f}) - LONG sinyali bastirildi, "
+            f"bu bolgede yalnizca SHORT dikkate alinir"
+        )
+        sig.direction = "NEUTRAL"
+    elif sig.direction == "SHORT" and pos <= cfg.CHANNEL_EDGE_ZONE:
+        sig.warnings.append(
+            f"144-periyot kanalda ALT banda yakin (poz {pos:.2f}) - SHORT sinyali bastirildi, "
+            f"bu bolgede yalnizca LONG dikkate alinir"
+        )
+        sig.direction = "NEUTRAL"
+
+
+# ==============================================================================
 # 9) ALARM SEVIYESI
 # ==============================================================================
 def classify_alert(cfg: Config, sig: Signal) -> str:
@@ -992,30 +1072,77 @@ def _regime_short(regime: str) -> str:
     return label.split(" (")[0]
 
 
+def generate_channel_chart_png(cfg: Config, sig: Signal) -> Optional[bytes]:
+    """main.py ile ayni mantik: son CHANNEL_PERIOD bar uzerinden fiyat +
+    lineer regresyon kanali grafigi. matplotlib yoksa/yetersiz veri varsa
+    None doner (cagiran taraf sade metne duser)."""
+    if plt is None or sig.snap is None:
+        return None
+    closes = sig.snap.close_series
+    period = cfg.CHANNEL_PERIOD
+    if len(closes) < period:
+        return None
+    try:
+        y = np.array(closes[-period:], dtype=float)
+        x = np.arange(period, dtype=float)
+        slope, intercept = np.polyfit(x, y, 1)
+        fitted = slope * x + intercept
+        resid_std = float(np.std(y - fitted))
+        upper = fitted + cfg.CHANNEL_STDEV_MULT * resid_std
+        lower = fitted - cfg.CHANNEL_STDEV_MULT * resid_std
+
+        fig, ax = plt.subplots(figsize=(6.4, 3.6), dpi=110)
+        ax.plot(x, y, color="#1f77b4", linewidth=1.3, label="Fiyat")
+        ax.plot(x, fitted, color="#888888", linewidth=1.0, linestyle="--", label="Orta")
+        ax.plot(x, upper, color="#d62728", linewidth=1.0, label="Ust bant")
+        ax.plot(x, lower, color="#2ca02c", linewidth=1.0, label="Alt bant")
+        ax.fill_between(x, lower, upper, color="#888888", alpha=0.08)
+        ax.scatter([x[-1]], [y[-1]], color="#000000", zorder=5, s=28)
+        ax.set_title(f"{sig.symbol} | {sig.timeframe} | {period}-periyot kanal", fontsize=10)
+        ax.set_xticks([])
+        ax.legend(loc="upper left", fontsize=7, frameon=False)
+        ax.tick_params(axis="y", labelsize=8)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        log.warning("Kanal grafigi uretilemedi %s [%s]: %s", sig.symbol, sig.timeframe, e)
+        return None
+
+
+# Butun Telegram mesajlarinin basinda ayni sabit baslik (main.py ile ayni).
+BOT_HEADER = "OI FUNDRATE KANAL BOT"
+
+
 def build_message(cfg: Config, sig: Signal) -> str:
+    """Sade Telegram mesaji: yon/skor/fiyat/kanal pozisyonu/SL + (varsa) en
+    kritik tek uyari. TP ve TradingView linki kaldirildi (kanal grafigi
+    zaten ayri foto olarak gidiyor)."""
     s = sig.snap
     tier_emoji = "🚨" if sig.tier == "STRONG" else "👀"
-    taker_txt = f"{s.taker_buy_ratio:.2f}" if not math.isnan(s.taker_buy_ratio) else "n/a"
 
     lines = [
+        BOT_HEADER,
         f"{tier_emoji} {sig.tier} | {sig.symbol} | {sig.direction} | {sig.timeframe}",
-        f"Skor: {sig.score:.0f}/100 | {_regime_short(s.regime)}",
-        f"Fiyat: {fmt_price(s.price)} | Hacim: {s.vol_chg_1:+.0f}%/{s.vol_chg_w:+.0f}% | Taker: {taker_txt}",
+        f"Skor: {sig.score:.0f}/100 | Fiyat: {fmt_price(s.price)}",
     ]
+    if not math.isnan(s.channel_pos):
+        lines.append(f"Kanal poz: {s.channel_pos * 100:.0f}% (0=alt bant, 100=ust bant)")
     if sig.stop_loss > 0:
-        lines.append(
-            f"SL: {fmt_price(sig.stop_loss)} ({sig.risk_pct:.1f}%) | "
-            f"TP1: {fmt_price(sig.take_profit1)} | TP2: {fmt_price(sig.take_profit2)}"
-        )
+        lines.append(f"SL: {fmt_price(sig.stop_loss)} ({sig.risk_pct:.1f}%)")
     if sig.warnings:
         lines.append(f"⚠️ {sig.warnings[0]}")
-    lines.append(f"📊 {tradingview_link(cfg, sig)}")
     return "\n".join(lines)
 
 
 def build_exit_message(cfg: Config, symbol: str, timeframe: str, prev_direction: str,
                        current_regime: str, price: float) -> str:
     return (
+        f"{BOT_HEADER}\n"
         f"🔔 REJIM DEGISTI | {symbol} | {timeframe}\n"
         f"{prev_direction} artik teyit edilmiyor -> {_regime_short(current_regime)}\n"
         f"Fiyat: {fmt_price(price)}"
@@ -1045,6 +1172,32 @@ def send_telegram(cfg: Config, text: str) -> bool:
         return False
     except Exception as e:
         log.warning("Telegram gonderim hatasi: %s", e)
+        return False
+
+
+def send_telegram_photo(cfg: Config, photo_png: bytes, caption: str) -> bool:
+    """Kanal grafigini caption'la birlikte Telegram'a foto olarak gonderir
+    (main.py ile ayni mantik)."""
+    if not cfg.TELEGRAM_ENABLED:
+        log.info("[TG kapali] foto gonderilmedi")
+        return False
+    if requests is None:
+        log.warning("requests yuklu degil; Telegram atlaniyor")
+        return False
+    if not cfg.TELEGRAM_BOT_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        log.warning("Telegram token/chat_id eksik")
+        return False
+    url = f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        files = {"photo": ("kanal.png", photo_png, "image/png")}
+        data = {"chat_id": cfg.TELEGRAM_CHAT_ID, "caption": caption[:1024]}
+        r = requests.post(url, data=data, files=files, timeout=25)
+        if r.status_code == 200 and r.json().get("ok"):
+            return True
+        log.warning("Telegram foto hata: %s %s", r.status_code, r.text[:200])
+        return False
+    except Exception as e:
+        log.warning("Telegram foto gonderim hatasi: %s", e)
         return False
 
 
@@ -1105,6 +1258,59 @@ class CooldownManager:
         if key in self.state:
             del self.state[key]
             self._save()
+
+
+# ==============================================================================
+# 11a) ALARM GECMISI (son N saat ozet mesaji icin, main.py ile ayni mantik)
+# ==============================================================================
+class AlertLog:
+    def __init__(self, cfg: Config, path: str = ALERT_LOG_FILE, keep_hours: float = 48.0):
+        self.cfg = cfg
+        self.path = path
+        self.keep_hours = keep_hours
+        self.entries: list = self._load()
+
+    def _load(self) -> list:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.entries, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning("Alarm gecmisi yazilamadi: %s", e)
+
+    def append(self, sig: Signal) -> None:
+        self.entries.append({
+            "symbol": sig.symbol, "timeframe": sig.timeframe, "direction": sig.direction,
+            "tier": sig.tier, "score": sig.score, "ts": time.time(),
+        })
+        cutoff = time.time() - self.keep_hours * 3600.0
+        self.entries = [e for e in self.entries if e.get("ts", 0) >= cutoff]
+        self._save()
+
+    def recent(self, hours: float) -> list:
+        cutoff = time.time() - hours * 3600.0
+        return [e for e in self.entries if e.get("ts", 0) >= cutoff]
+
+
+def build_summary_message(entries: list, hours: float) -> str:
+    lines = [BOT_HEADER, f"🕐 Son {hours:.0f} saat sinyal ozeti"]
+    if not entries:
+        lines.append("Bu surede sinyal olusmadi.")
+        return "\n".join(lines)
+    for e in sorted(entries, key=lambda x: x.get("ts", 0)):
+        t = datetime.fromtimestamp(e.get("ts", 0), timezone.utc).strftime("%H:%M")
+        tier_emoji = "🚨" if e.get("tier") == "STRONG" else "👀"
+        lines.append(
+            f"{tier_emoji} {e.get('symbol')} {e.get('direction')} {e.get('timeframe')} "
+            f"skor={e.get('score', 0):.0f} | {t} UTC"
+        )
+    return "\n".join(lines)
 
 
 # ==============================================================================
@@ -1245,6 +1451,7 @@ async def process_symbol(cfg: Config, client: ExchangeClient, symbol: str,
             snap = build_snapshot(cfg, symbol, df)
             sig = evaluate(cfg, snap, tf)
             sig.ex_symbol = ex_symbol
+            apply_channel_filter(cfg, sig)     # 144-periyot kanal: banda yakinken ters yon bastirilir
             sig.tier = classify_alert(cfg, sig)
             signals.append(sig)
 
@@ -1256,7 +1463,8 @@ async def process_symbol(cfg: Config, client: ExchangeClient, symbol: str,
 # 14) TARAMA TURU (async)
 # ==============================================================================
 async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManager,
-                    symbols: list[str], perf: Optional["PerformanceTracker"] = None) -> None:
+                    symbols: list[str], perf: Optional["PerformanceTracker"] = None,
+                    alert_log: Optional["AlertLog"] = None) -> None:
     t0 = time.time()
     log.info("=" * 78)
     log.info("Spot taramasi basladi | %s | %d coin | tf=%s | paralellik=%d",
@@ -1304,16 +1512,30 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
     for sig in sorted(signals, key=lambda x: x.score, reverse=True):
         if sig.tier in ("STRONG", "WATCH") and cooldown.should_alert(sig):
             msg = build_message(cfg, sig)
-            ok = await asyncio.to_thread(send_telegram, cfg, msg)
+            png = generate_channel_chart_png(cfg, sig)
+            if png is not None:
+                ok = await asyncio.to_thread(send_telegram_photo, cfg, png, msg)
+                if not ok:
+                    ok = await asyncio.to_thread(send_telegram, cfg, msg)
+            else:
+                ok = await asyncio.to_thread(send_telegram, cfg, msg)
             if ok:
                 log.info("📨 Telegram gonderildi: %s [%s] (%s)", sig.symbol, sig.timeframe, sig.tier)
                 cooldown.record(sig)
                 alerts += 1
                 if perf is not None:
                     perf.open_trade(sig)
+                if alert_log is not None:
+                    alert_log.append(sig)
 
     if perf is not None:
         perf.update(signals)
+
+    if alert_log is not None:
+        summary_msg = build_summary_message(alert_log.recent(12), 12)
+        ok = await asyncio.to_thread(send_telegram, cfg, summary_msg)
+        if ok:
+            log.info("🕐 12 saatlik ozet mesaji gonderildi.")
 
     dt = time.time() - t0
     log.info("-" * 78)
@@ -1575,10 +1797,11 @@ async def run_scanner(cfg: Config, once: bool) -> None:
     try:
         cooldown = CooldownManager(cfg)
         perf = PerformanceTracker(cfg)
+        alert_log = AlertLog(cfg)
 
         if once:
             await ensure_markets(client)
-            await scan_once(cfg, client, cooldown, SYMBOLS, perf)
+            await scan_once(cfg, client, cooldown, SYMBOLS, perf, alert_log)
             log.info("Sanal performans ozeti: %s", perf.summary())
             return
 
@@ -1588,7 +1811,7 @@ async def run_scanner(cfg: Config, once: bool) -> None:
         while True:
             try:
                 await ensure_markets(client)
-                await scan_once(cfg, client, cooldown, SYMBOLS, perf)
+                await scan_once(cfg, client, cooldown, SYMBOLS, perf, alert_log)
                 log.info("Sanal performans ozeti: %s", perf.summary())
             except asyncio.CancelledError:
                 raise

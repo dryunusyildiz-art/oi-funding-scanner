@@ -73,7 +73,7 @@ import asyncio
 import logging
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 import numpy as np
@@ -219,13 +219,26 @@ class Config:
     MIN_ATR_PCT: float = float(_env("MIN_ATR_PCT", "0.15"))
 
     # --- 144 periodluk lineer regresyon kanali filtresi ---
-    # main.py ile ayni mantik: fiyat UST banda yakinken sadece SHORT, ALT
-    # banda yakinken sadece LONG sinyali dikkate alinir (kanal ici/swing
-    # trade R:R'i icin ters yonde sinyal bastirilir). Orta bolgede dokunulmaz.
+    # Sadece kanalin ILGILI bandina yakin sinyaller iletilir: LONG yalnizca
+    # ALT banda yakinken, SHORT yalnizca UST banda yakinken (kanal ici/swing
+    # trade mantigi). Orta bolgedeki ve yanlis yondeki banda-yakin sinyaller
+    # TAMAMEN bastirilir (bkz. apply_channel_filter).
     CHANNEL_FILTER_ENABLED: bool = _env("CHANNEL_FILTER_ENABLED", "true").lower() == "true"
     CHANNEL_PERIOD: int = int(_env("CHANNEL_PERIOD", "144"))
     CHANNEL_STDEV_MULT: float = float(_env("CHANNEL_STDEV_MULT", "2.0"))
     CHANNEL_EDGE_ZONE: float = float(_env("CHANNEL_EDGE_ZONE", "0.15"))
+
+    # --- Son N saat sinyal ozeti (Telegram) ---
+    # Sadece belirlenen TR saatlerinde (varsayilan 09:00 ve 21:00) gonderilir;
+    # o pencerede hicbir sinyal olusmadiysa mesaj HIC gonderilmez (bos "sinyal
+    # yok" mesaji istenmiyor). SUMMARY_WINDOW_MINUTES: hedef saate ne kadar
+    # yakinsa "o an" sayilsin. SUMMARY_MIN_GAP_HOURS: ayni pencerede birden
+    # fazla taramada tekrar tekrar gonderilmesin diye asgari bekleme suresi.
+    SUMMARY_ENABLED: bool = _env("SUMMARY_ENABLED", "true").lower() == "true"
+    SUMMARY_TIMES: str = _env("SUMMARY_TIMES", "09:00,21:00")
+    SUMMARY_TZ_OFFSET_HOURS: float = float(_env("SUMMARY_TZ_OFFSET_HOURS", "3.0"))  # TR = UTC+3
+    SUMMARY_WINDOW_MINUTES: float = float(_env("SUMMARY_WINDOW_MINUTES", "30"))
+    SUMMARY_MIN_GAP_HOURS: float = float(_env("SUMMARY_MIN_GAP_HOURS", "6.0"))
 
     # --- Coklu zaman dilimi confluence ---
     CONFLUENCE_BONUS: float = float(_env("CONFLUENCE_BONUS", "8"))
@@ -897,24 +910,30 @@ def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
 # 8b) 144 PERIODLUK REGRESYON KANALI FILTRESI (main.py ile ayni mantik)
 # ==============================================================================
 def apply_channel_filter(cfg: Config, sig: Signal) -> None:
-    """Fiyat UST banda yakinken LONG, ALT banda yakinken SHORT sinyalini
-    yerinde bastirir (sig.direction -> NEUTRAL). Bkz. main.py apply_channel_filter."""
+    """Sadece kanalin ILGILI bandina yakin sinyalleri gecirir (kullanicinin
+    kanal-ici/swing trade tarzi): LONG yalnizca ALT banda yakinken, SHORT
+    yalnizca UST banda yakinken anlamli sayilir.
+
+    Kanalin ORTA bolgesindeki sinyaller (banda yakin degil, ne LONG ne SHORT
+    icin net bir kenar/donus noktasi yok) "zayif" kabul edilip TAMAMEN
+    bastirilir; yanlis yondeki banda-yakin sinyaller de (LONG+ust banda
+    yakin, SHORT+alt banda yakin -- momentum/tukenme bolgesi) bastirilir.
+    Yani her sinyal ya LONG+alt-banda-yakin ya da SHORT+ust-banda-yakin
+    olmak zorunda, aksi halde iletilmez."""
     if not cfg.CHANNEL_FILTER_ENABLED or sig.snap is None or sig.direction == "NEUTRAL":
         return
     pos = sig.snap.channel_pos
     if math.isnan(pos):
         return
-    if sig.direction == "LONG" and pos >= (1.0 - cfg.CHANNEL_EDGE_ZONE):
-        sig.warnings.append(
-            f"144-periyot kanalda UST banda yakin (poz {pos:.2f}) - LONG sinyali bastirildi, "
-            f"bu bolgede yalnizca SHORT dikkate alinir"
-        )
+    near_upper = pos >= (1.0 - cfg.CHANNEL_EDGE_ZONE)
+    near_lower = pos <= cfg.CHANNEL_EDGE_ZONE
+    if sig.direction == "LONG" and not near_lower:
+        reason = "UST banda yakin (momentum/tukenme bolgesi)" if near_upper else "kanalin orta bolgesinde (banda yakin degil)"
+        sig.warnings.append(f"144-periyot kanalda {reason} (poz {pos:.2f}) - LONG sinyali bastirildi")
         sig.direction = "NEUTRAL"
-    elif sig.direction == "SHORT" and pos <= cfg.CHANNEL_EDGE_ZONE:
-        sig.warnings.append(
-            f"144-periyot kanalda ALT banda yakin (poz {pos:.2f}) - SHORT sinyali bastirildi, "
-            f"bu bolgede yalnizca LONG dikkate alinir"
-        )
+    elif sig.direction == "SHORT" and not near_upper:
+        reason = "ALT banda yakin (momentum/tukenme bolgesi)" if near_lower else "kanalin orta bolgesinde (banda yakin degil)"
+        sig.warnings.append(f"144-periyot kanalda {reason} (poz {pos:.2f}) - SHORT sinyali bastirildi")
         sig.direction = "NEUTRAL"
 
 
@@ -1264,23 +1283,39 @@ class CooldownManager:
 # 11a) ALARM GECMISI (son N saat ozet mesaji icin, main.py ile ayni mantik)
 # ==============================================================================
 class AlertLog:
+    """Gonderilen alarmlarin kalici gecmisi + son ozet-gonderim zamani.
+
+    last_summary_ts: 12-saatlik ozet mesaji EN SON ne zaman gonderildi
+    (dedup icin -- ayni saat penceresinde birden fazla taramada tekrar
+    gonderilmesin diye). Eski dosya formati (duz liste) ile geriye
+    uyumludur.
+    """
+
     def __init__(self, cfg: Config, path: str = ALERT_LOG_FILE, keep_hours: float = 48.0):
         self.cfg = cfg
         self.path = path
         self.keep_hours = keep_hours
-        self.entries: list = self._load()
+        data = self._load()
+        self.entries: list = data.get("entries", [])
+        self.last_summary_ts: Optional[float] = data.get("last_summary_ts")
 
-    def _load(self) -> list:
+    def _load(self) -> dict:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, list):          # eski format: duz liste
+                return {"entries": data, "last_summary_ts": None}
+            if isinstance(data, dict):
+                return data
         except Exception:
-            return []
+            pass
+        return {"entries": [], "last_summary_ts": None}
 
     def _save(self) -> None:
         try:
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.entries, f, ensure_ascii=False, indent=2)
+                json.dump({"entries": self.entries, "last_summary_ts": self.last_summary_ts},
+                          f, ensure_ascii=False, indent=2)
         except Exception as e:
             log.warning("Alarm gecmisi yazilamadi: %s", e)
 
@@ -1297,8 +1332,54 @@ class AlertLog:
         cutoff = time.time() - hours * 3600.0
         return [e for e in self.entries if e.get("ts", 0) >= cutoff]
 
+    def mark_summary_sent(self) -> None:
+        self.last_summary_ts = time.time()
+        self._save()
+
+
+def _parse_summary_times(spec: str) -> list:
+    """'09:00,21:00' -> [(9,0), (21,0)]. Gecersiz parcalar sessizce atlanir."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            hh, mm = part.split(":")
+            out.append((int(hh), int(mm)))
+        except Exception:
+            continue
+    return out
+
+
+def should_send_summary(cfg: Config, alert_log: "AlertLog") -> bool:
+    """Su an, kullanicinin belirledigi ozet saatlerinden (TR saatine gore,
+    varsayilan 09:00/21:00) birine SUMMARY_WINDOW_MINUTES icinde miyiz VE
+    ayni pencerede daha once (SUMMARY_MIN_GAP_HOURS icinde) ozet gonderilmis
+    mi -- ikisine de bakarak karar verir. Icerik bos olsa bile burasi True
+    donebilir; "bos ise gonderme" karari cagiran tarafta (scan_once) verilir,
+    boylece bos pencerede last_summary_ts guncellenmez ve ayni pencerede
+    sonradan bir sinyal gelirse ozet yine gonderilebilir."""
+    if not cfg.SUMMARY_ENABLED:
+        return False
+    times = _parse_summary_times(cfg.SUMMARY_TIMES)
+    if not times:
+        return False
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc + timedelta(hours=cfg.SUMMARY_TZ_OFFSET_HOURS)
+    last_ts = alert_log.last_summary_ts
+    for hh, mm in times:
+        target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        diff_min = abs((now_local - target).total_seconds()) / 60.0
+        if diff_min <= cfg.SUMMARY_WINDOW_MINUTES:
+            if last_ts is None or (time.time() - last_ts) >= cfg.SUMMARY_MIN_GAP_HOURS * 3600.0:
+                return True
+    return False
+
 
 def build_summary_message(entries: list, hours: float) -> str:
+    """Yalnizca en az 1 kayit varken cagirilmasi beklenir (bkz. scan_once);
+    yine de bos gelirse sade bir bilgi satiri doner."""
     lines = [BOT_HEADER, f"🕐 Son {hours:.0f} saat sinyal ozeti"]
     if not entries:
         lines.append("Bu surede sinyal olusmadi.")
@@ -1531,11 +1612,21 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
     if perf is not None:
         perf.update(signals)
 
-    if alert_log is not None:
-        summary_msg = build_summary_message(alert_log.recent(12), 12)
-        ok = await asyncio.to_thread(send_telegram, cfg, summary_msg)
-        if ok:
-            log.info("🕐 12 saatlik ozet mesaji gonderildi.")
+    # son 12 saat sinyal ozeti: SADECE kullanicinin belirledigi saatlerde
+    # (varsayilan TR 09:00/21:00, bkz. SUMMARY_TIMES) VE o pencerede en az
+    # 1 sinyal varsa gonderilir. Bos pencerede HICBIR mesaj atilmaz (ne
+    # "sinyal yok" metni ne baska bir sey) ve last_summary_ts guncellenmez,
+    # boylece ayni pencerede sonradan bir sinyal gelirse yine gonderilebilir.
+    if alert_log is not None and should_send_summary(cfg, alert_log):
+        recent = alert_log.recent(12)
+        if recent:
+            summary_msg = build_summary_message(recent, 12)
+            ok = await asyncio.to_thread(send_telegram, cfg, summary_msg)
+            if ok:
+                alert_log.mark_summary_sent()
+                log.info("🕐 12 saatlik ozet mesaji gonderildi.")
+        else:
+            log.info("12 saatlik ozet penceresi ama sinyal yok -> mesaj atlandi.")
 
     dt = time.time() - t0
     log.info("-" * 78)

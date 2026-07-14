@@ -210,10 +210,12 @@ class Config:
     MIN_SCORE_WATCH: float = float(_env("MIN_SCORE_WATCH", "60"))
     MIN_VOLUME_RATIO_STRONG: float = float(_env("MIN_VOLUME_RATIO_STRONG", "1.2"))
 
-    # --- Risk yonetimi: ATR bazli SL/TP ---
+    # --- Risk yonetimi: ATR bazli SL, kanal bazli TEK TP ---
+    # TP artik iki kademeli degil: kanalin KARSI bandi hedeflenir (kanal ici
+    # trade mantigi). ATR_TP1_R sadece kanal verisi yoksa/gecersizse devreye
+    # giren YEDEK hedefin R-katsayisidir (bkz. compute_sl_tp).
     ATR_SL_MULT: float = float(_env("ATR_SL_MULT", "1.5"))
     ATR_TP1_R: float = float(_env("ATR_TP1_R", "2.0"))
-    ATR_TP2_R: float = float(_env("ATR_TP2_R", "3.0"))
 
     # --- Volatilite filtresi ---
     MIN_ATR_PCT: float = float(_env("MIN_ATR_PCT", "0.15"))
@@ -472,8 +474,9 @@ class Signal:
     tier: str = "NONE"
     snap: Optional[MarketSnapshot] = None
     stop_loss: float = 0.0
-    take_profit1: float = 0.0
-    take_profit2: float = 0.0
+    # TEK hedef: kanalin KARSI bandi (kanal ici trade mantigi). Kanal verisi
+    # yoksa ATR bazli yedek hedefe duser (bkz. compute_sl_tp).
+    take_profit: float = 0.0
     risk_pct: float = 0.0
     # WEAK_RALLY/WEAK_DECLINE + banda-yakinlik ile tetiklenmis, hacim teyidi
     # henuz olusmamis dusuk-teyitli "erken" sinyal mi? (bkz. determine_direction)
@@ -887,24 +890,31 @@ def determine_direction(cfg: Config, s: MarketSnapshot) -> str:
 
 
 def compute_sl_tp(cfg: Config, s: MarketSnapshot, direction: str,
-                  early: bool = False) -> tuple[float, float, float, float]:
+                  early: bool = False) -> tuple[float, float, float]:
+    """SL: ATR bazli (erken/dusuk-teyitli sinyallerde ATR_SL_MULT_EARLY ile
+    daha siki). TP: TEK hedef -- kanalin KARSI bandi (kanal ici trade
+    mantigi: alt banda yakin girilen LONG icin hedef ust bant, ust banda
+    yakin girilen SHORT icin hedef alt bant). Kanal verisi yoksa (NaN) veya
+    karsi bant fiyatin YANLIS tarafindaysa (cok dar/bozuk kanal) ATR bazli
+    yedek hedefe (ATR_TP1_R kati) duser -- boylece TP hicbir zaman 0/gecersiz
+    kalmaz."""
     if direction not in ("LONG", "SHORT") or s.atr_pct <= 0 or s.price <= 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0
     atr_abs = s.price * (s.atr_pct / 100.0)
     sl_mult = cfg.ATR_SL_MULT_EARLY if early else cfg.ATR_SL_MULT
     risk_abs = sl_mult * atr_abs
     if risk_abs <= 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0
     if direction == "LONG":
         sl = s.price - risk_abs
-        tp1 = s.price + cfg.ATR_TP1_R * risk_abs
-        tp2 = s.price + cfg.ATR_TP2_R * risk_abs
+        fallback_tp = s.price + cfg.ATR_TP1_R * risk_abs
+        tp = s.channel_upper if (not math.isnan(s.channel_upper) and s.channel_upper > s.price) else fallback_tp
     else:
         sl = s.price + risk_abs
-        tp1 = s.price - cfg.ATR_TP1_R * risk_abs
-        tp2 = s.price - cfg.ATR_TP2_R * risk_abs
+        fallback_tp = s.price - cfg.ATR_TP1_R * risk_abs
+        tp = s.channel_lower if (not math.isnan(s.channel_lower) and s.channel_lower < s.price) else fallback_tp
     risk_pct = risk_abs / s.price * 100.0
-    return sl, tp1, tp2, risk_pct
+    return sl, tp, risk_pct
 
 
 def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
@@ -925,7 +935,7 @@ def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
 
     reasons = reg_r + vr_r + tak_r + volu_r + trend_r
 
-    sl, tp1, tp2, risk_pct = compute_sl_tp(cfg, s, direction, early)
+    sl, tp, risk_pct = compute_sl_tp(cfg, s, direction, early)
 
     if direction == "LONG":
         invalidation = f"Hacim rejimi dususu + EMA20 alti {timeframe} kapanis ({fmt_price(s.ema20)})"
@@ -941,7 +951,7 @@ def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
         risk_penalty=risk_p,
         reasons=reasons, warnings=risk_w, price=s.price,
         invalidation=invalidation, snap=s,
-        stop_loss=sl, take_profit1=tp1, take_profit2=tp2, risk_pct=risk_pct,
+        stop_loss=sl, take_profit=tp, risk_pct=risk_pct,
         early=early,
     )
 
@@ -1187,37 +1197,27 @@ BOT_HEADER = "OI FUNDRATE KANAL BOT"
 
 
 def build_message(cfg: Config, sig: Signal) -> str:
-    """Sade Telegram mesaji: yon/skor/fiyat/kanal pozisyonu/SL + (varsa) en
-    kritik tek uyari. TP ve TradingView linki kaldirildi (kanal grafigi
-    zaten ayri foto olarak gidiyor)."""
+    """Sade Telegram mesaji: yon/skor/fiyat/kanal pozisyonu/SL/TP + (varsa)
+    en kritik tek uyari. TUM LONG/SHORT sinyalleri (erken/dusuk-teyitli olsun
+    olmasin) AYNI formatta gelir -- erken/normal ayrimi mesaja YANSITILMAZ,
+    sadece arka planda skor/SL siki liginde kullanilir (bkz. evaluate)."""
     s = sig.snap
     tier_emoji = "🚨" if sig.tier == "STRONG" else "👀"
-    early_tag = " ⚡ERKEN" if sig.early else ""
 
     lines = [
         BOT_HEADER,
-        f"{tier_emoji} {sig.tier}{early_tag} | {sig.symbol} | {sig.direction} | {sig.timeframe}",
+        f"{tier_emoji} {sig.tier} | {sig.symbol} | {sig.direction} | {sig.timeframe}",
         f"Skor: {sig.score:.0f}/100 | Fiyat: {fmt_price(s.price)}",
     ]
-    if sig.early:
-        lines.append("⚡ Erken sinyal: hacim teyidi henuz yok, dusuk konviksiyon")
     if not math.isnan(s.channel_pos):
         lines.append(f"Kanal poz: {s.channel_pos * 100:.0f}% (0=alt bant, 100=ust bant)")
     if sig.stop_loss > 0:
         lines.append(f"SL: {fmt_price(sig.stop_loss)} ({sig.risk_pct:.1f}%)")
+    if sig.take_profit > 0:
+        lines.append(f"TP: {fmt_price(sig.take_profit)}")
     if sig.warnings:
         lines.append(f"⚠️ {sig.warnings[0]}")
     return "\n".join(lines)
-
-
-def build_exit_message(cfg: Config, symbol: str, timeframe: str, prev_direction: str,
-                       current_regime: str, price: float) -> str:
-    return (
-        f"{BOT_HEADER}\n"
-        f"🔔 REJIM DEGISTI | {symbol} | {timeframe}\n"
-        f"{prev_direction} artik teyit edilmiyor -> {_regime_short(current_regime)}\n"
-        f"Fiyat: {fmt_price(price)}"
-    )
 
 
 def send_telegram(cfg: Config, text: str) -> bool:
@@ -1439,9 +1439,8 @@ def build_summary_message(entries: list, hours: float) -> str:
     for e in sorted(entries, key=lambda x: x.get("ts", 0)):
         t = datetime.fromtimestamp(e.get("ts", 0), timezone.utc).strftime("%H:%M")
         tier_emoji = "🚨" if e.get("tier") == "STRONG" else "👀"
-        early_tag = " ⚡" if e.get("early") else ""
         lines.append(
-            f"{tier_emoji}{early_tag} {e.get('symbol')} {e.get('direction')} {e.get('timeframe')} "
+            f"{tier_emoji} {e.get('symbol')} {e.get('direction')} {e.get('timeframe')} "
             f"skor={e.get('score', 0):.0f} | {t} UTC"
         )
     return "\n".join(lines)
@@ -1471,7 +1470,10 @@ class PerformanceTracker:
             log.warning("Perf kaydi yazilamadi: %s", e)
 
     def open_trade(self, sig: Signal) -> None:
-        if not self.cfg.PERF_TRACKING_ENABLED or sig.stop_loss <= 0:
+        """Tek hedefli (SL/TP) sanal islem acar. R-katsayisi, gercek giris/SL/
+        TP mesafelerinden hesaplanir (kanal hedefi ATR'den bagimsiz oldugu
+        icin sabit bir R degil, islem bazinda degisir)."""
+        if not self.cfg.PERF_TRACKING_ENABLED or sig.stop_loss <= 0 or sig.take_profit <= 0:
             return
         already_open = any(
             t for t in self.trades
@@ -1479,17 +1481,20 @@ class PerformanceTracker:
         )
         if already_open:
             return
+        risk_abs = abs(sig.price - sig.stop_loss)
+        reward_abs = abs(sig.take_profit - sig.price)
+        r_multiple = (reward_abs / risk_abs) if risk_abs > 0 else 0.0
         self.trades.append({
             "symbol": sig.symbol, "timeframe": sig.timeframe, "direction": sig.direction,
-            "tier": sig.tier, "entry": sig.price, "sl": sig.stop_loss,
-            "tp1": sig.take_profit1, "tp2": sig.take_profit2,
-            "tp1_r": self.cfg.ATR_TP1_R, "tp2_r": self.cfg.ATR_TP2_R,
-            "status": "OPEN", "stage": "INIT",
+            "tier": sig.tier, "entry": sig.price, "sl": sig.stop_loss, "tp": sig.take_profit,
+            "r_multiple": r_multiple,
+            "status": "OPEN",
             "opened_ts": time.time(), "closed_ts": None, "result_r": None,
         })
         self._save()
 
     def update(self, signals: list[Signal]) -> None:
+        """Tek hedefli kapama: SL -> -1R, TP -> islemin kendi r_multiple'i."""
         if not self.cfg.PERF_TRACKING_ENABLED:
             return
         price_map = {(s.symbol, s.timeframe): s.price for s in signals}
@@ -1501,30 +1506,17 @@ class PerformanceTracker:
             if price is None:
                 continue
             direction = t["direction"]
-            if t["stage"] == "INIT":
-                if direction == "LONG":
-                    if price <= t["sl"]:
-                        t["status"] = "CLOSED"; t["result_r"] = -1.0; t["closed_ts"] = time.time()
-                    elif price >= t["tp1"]:
-                        t["stage"] = "TP1_HIT"; t["sl"] = t["entry"]
-                else:
-                    if price >= t["sl"]:
-                        t["status"] = "CLOSED"; t["result_r"] = -1.0; t["closed_ts"] = time.time()
-                    elif price <= t["tp1"]:
-                        t["stage"] = "TP1_HIT"; t["sl"] = t["entry"]
-                dirty = True
-            elif t["stage"] == "TP1_HIT":
-                if direction == "LONG":
-                    if price >= t["tp2"]:
-                        t["status"] = "CLOSED"; t["result_r"] = (t["tp1_r"] + t["tp2_r"]) / 2.0; t["closed_ts"] = time.time()
-                    elif price <= t["sl"]:
-                        t["status"] = "CLOSED"; t["result_r"] = t["tp1_r"] / 2.0; t["closed_ts"] = time.time()
-                else:
-                    if price <= t["tp2"]:
-                        t["status"] = "CLOSED"; t["result_r"] = (t["tp1_r"] + t["tp2_r"]) / 2.0; t["closed_ts"] = time.time()
-                    elif price >= t["sl"]:
-                        t["status"] = "CLOSED"; t["result_r"] = t["tp1_r"] / 2.0; t["closed_ts"] = time.time()
-                dirty = True
+            if direction == "LONG":
+                if price <= t["sl"]:
+                    t["status"] = "CLOSED"; t["result_r"] = -1.0; t["closed_ts"] = time.time()
+                elif price >= t["tp"]:
+                    t["status"] = "CLOSED"; t["result_r"] = t["r_multiple"]; t["closed_ts"] = time.time()
+            else:
+                if price >= t["sl"]:
+                    t["status"] = "CLOSED"; t["result_r"] = -1.0; t["closed_ts"] = time.time()
+                elif price <= t["tp"]:
+                    t["status"] = "CLOSED"; t["result_r"] = t["r_multiple"]; t["closed_ts"] = time.time()
+            dirty = True
         if dirty:
             self._save()
 
@@ -1548,7 +1540,7 @@ def print_summary(sig: Signal) -> None:
     taker = f"{s.taker_buy_ratio:.2f}" if s and not math.isnan(s.taker_buy_ratio) else "n/a"
     tag = {"STRONG": "🚨", "WATCH": "👀", "NONE": "  "}.get(sig.tier, "  ")
     log.info("%s %-13s %-4s %-7s skor=%5.1f volreg=%.0f rejim=%.0f taker_s=%.0f volu=%.0f trend=%.0f "
-             "conf=%+.0f btc=%+.0f risk=-%.0f | V1=%+.0f%% Vw=%+.0f%% taker=%s VR=%.2f [%s] SL=%s TP1=%s",
+             "conf=%+.0f btc=%+.0f risk=-%.0f | V1=%+.0f%% Vw=%+.0f%% taker=%s VR=%.2f [%s] SL=%s TP=%s%s",
              tag, sig.symbol, sig.timeframe, sig.direction, sig.score,
              sig.volume_regime_score, sig.regime_score, sig.taker_score,
              sig.volume_score, sig.trend_score,
@@ -1556,7 +1548,8 @@ def print_summary(sig: Signal) -> None:
              s.vol_chg_1 if s else 0.0, s.vol_chg_w if s else 0.0, taker,
              s.vol_ratio if s else 0.0, s.regime if s else "-",
              fmt_price(sig.stop_loss) if sig.stop_loss else "-",
-             fmt_price(sig.take_profit1) if sig.take_profit1 else "-")
+             fmt_price(sig.take_profit) if sig.take_profit else "-",
+             " ERKEN" if sig.early else "")
 
 
 # ==============================================================================
@@ -1623,8 +1616,11 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
     for sig in sorted(signals, key=lambda x: x.score, reverse=True):
         print_summary(sig)
 
+    # yon degisti/kayboldu -> mesaj GONDERILMEZ (kullanici istegi: sadece
+    # LONG/SHORT giris sinyalleri, pozisyon takip/kapanis bildirimi yok);
+    # ama cooldown temizlenir ki ayni sembol/TF'de yeni bir sinyal olustugunda
+    # bekletilmeden hemen iletilebilsin.
     sig_by_key = {(s.symbol, s.timeframe): s for s in signals}
-    exit_alerts = 0
     for key, prev in list(cooldown.state.items()):
         prev_dir = prev.get("direction")
         if prev_dir not in ("LONG", "SHORT"):
@@ -1634,12 +1630,6 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
         if cur is None:
             continue
         if cur.direction != prev_dir:
-            msg = build_exit_message(cfg, symbol, timeframe, prev_dir, cur.snap.regime if cur.snap else "-", cur.price)
-            ok = await asyncio.to_thread(send_telegram, cfg, msg)
-            if ok:
-                log.info("🔔 Exit/gozden-gecir bildirimi: %s [%s] (%s -> %s)",
-                         symbol, timeframe, prev_dir, cur.direction)
-                exit_alerts += 1
             cooldown.clear(key)
 
     alerts = 0
@@ -1683,8 +1673,8 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
 
     dt = time.time() - t0
     log.info("-" * 78)
-    log.info("Tarama bitti. Sinyal(coin x TF)=%d, alarm=%d, exit=%d, sure=%.1fs",
-             len(signals), alerts, exit_alerts, dt)
+    log.info("Tarama bitti. Sinyal(coin x TF)=%d, alarm=%d, sure=%.1fs",
+             len(signals), alerts, dt)
 
 
 # ==============================================================================
@@ -1739,37 +1729,28 @@ def run_selftest(cfg: Config) -> None:
 # 15b) BACKTEST
 # ==============================================================================
 def simulate_forward(cfg: Config, sig: Signal, future: pd.DataFrame) -> Optional[float]:
-    if sig.stop_loss <= 0 or len(future) == 0:
+    """Tek hedefli (SL/TP) ileri-yon simulasyon: SL -> -1R, TP -> islemin
+    kendi r_multiple'i (giris/SL/TP mesafelerinden hesaplanir)."""
+    if sig.stop_loss <= 0 or sig.take_profit <= 0 or len(future) == 0:
         return None
     direction = sig.direction
     sl = sig.stop_loss
-    tp1 = sig.take_profit1
-    tp2 = sig.take_profit2
-    stage = "INIT"
+    tp = sig.take_profit
+    risk_abs = abs(sig.price - sig.stop_loss)
+    reward_abs = abs(sig.take_profit - sig.price)
+    r_multiple = (reward_abs / risk_abs) if risk_abs > 0 else 0.0
     for _, row in future.iterrows():
         hi, lo = float(row["high"]), float(row["low"])
         if direction == "LONG":
-            if stage == "INIT":
-                if lo <= sl:
-                    return -1.0
-                if hi >= tp1:
-                    stage = "TP1_HIT"; sl = sig.price
-            else:
-                if hi >= tp2:
-                    return (cfg.ATR_TP1_R + cfg.ATR_TP2_R) / 2.0
-                if lo <= sl:
-                    return cfg.ATR_TP1_R / 2.0
+            if lo <= sl:
+                return -1.0
+            if hi >= tp:
+                return r_multiple
         else:
-            if stage == "INIT":
-                if hi >= sl:
-                    return -1.0
-                if lo <= tp1:
-                    stage = "TP1_HIT"; sl = sig.price
-            else:
-                if lo <= tp2:
-                    return (cfg.ATR_TP1_R + cfg.ATR_TP2_R) / 2.0
-                if hi >= sl:
-                    return cfg.ATR_TP1_R / 2.0
+            if hi >= sl:
+                return -1.0
+            if lo <= tp:
+                return r_multiple
     return None
 
 

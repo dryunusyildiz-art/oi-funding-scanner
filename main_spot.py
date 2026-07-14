@@ -226,7 +226,20 @@ class Config:
     CHANNEL_FILTER_ENABLED: bool = _env("CHANNEL_FILTER_ENABLED", "true").lower() == "true"
     CHANNEL_PERIOD: int = int(_env("CHANNEL_PERIOD", "144"))
     CHANNEL_STDEV_MULT: float = float(_env("CHANNEL_STDEV_MULT", "2.0"))
-    CHANNEL_EDGE_ZONE: float = float(_env("CHANNEL_EDGE_ZONE", "0.15"))
+    CHANNEL_EDGE_ZONE: float = float(_env("CHANNEL_EDGE_ZONE", "0.10"))
+
+    # --- Erken kanal girisi (WEAK_RALLY/WEAK_DECLINE banda yakinken) ---
+    # Normalde WEAK_RALLY (fiyat UP + hacim DOWN) ve WEAK_DECLINE (fiyat DOWN +
+    # hacim DOWN) rejimleri NEUTRAL sayilir (hacim teyidi yok). ANCAK fiyat
+    # kanalin ILGILI bandina zaten yakinsa, bunlar "bandan ilk kalkis" isareti
+    # olabilir -- hacim teyidi (ACCUMULATION/DISTRIBUTION_BUILDUP) olusana
+    # kadar bekleseydik hareket zaten ilerlemis olurdu. Bu yuzden banda
+    # yakinken bu rejimler de erken (dusuk-teyitli) LONG/SHORT tetikleyicisi
+    # sayilir; boyle sinyaller sig.early=True ile isaretlenir, skor tarafinda
+    # daha az puan alir, STRONG olamaz (en fazla WATCH) ve daha siki bir SL
+    # ile acilir (bkz. ATR_SL_MULT_EARLY, score_regime, classify_alert).
+    EARLY_CHANNEL_ENTRY_ENABLED: bool = _env("EARLY_CHANNEL_ENTRY_ENABLED", "true").lower() == "true"
+    ATR_SL_MULT_EARLY: float = float(_env("ATR_SL_MULT_EARLY", "1.0"))
 
     # --- Son N saat sinyal ozeti (Telegram) ---
     # Sadece belirlenen TR saatlerinde (varsayilan 09:00 ve 21:00) gonderilir;
@@ -462,6 +475,9 @@ class Signal:
     take_profit1: float = 0.0
     take_profit2: float = 0.0
     risk_pct: float = 0.0
+    # WEAK_RALLY/WEAK_DECLINE + banda-yakinlik ile tetiklenmis, hacim teyidi
+    # henuz olusmamis dusuk-teyitli "erken" sinyal mi? (bkz. determine_direction)
+    early: bool = False
 
 
 # ==============================================================================
@@ -723,12 +739,16 @@ def score_volume_regime(cfg: Config, s: MarketSnapshot) -> tuple[float, list[str
     return min(pts, 30.0), reasons
 
 
-def score_regime(s: MarketSnapshot) -> tuple[float, list[str]]:
+def score_regime(s: MarketSnapshot, direction: str = "NEUTRAL") -> tuple[float, list[str]]:
     pts = 0.0
     reasons: list[str] = []
     if s.regime in (REGIME_ACCUMULATION_BUILDUP, REGIME_DISTRIBUTION_BUILDUP):
         pts = 20.0
         reasons.append(f"Rejim: {REGIME_LABEL_TR[s.regime]}")
+    elif direction in ("LONG", "SHORT") and s.regime in (REGIME_WEAK_RALLY, REGIME_WEAK_DECLINE):
+        # erken/dusuk-teyitli tetik: hacim teyidi henuz yok, bu yuzden yari puan
+        pts = 10.0
+        reasons.append(f"Erken kanal tetigi: {REGIME_LABEL_TR[s.regime]} (hacim teyidi henuz yok)")
     return pts, reasons
 
 
@@ -844,19 +864,35 @@ def score_risk(cfg: Config, s: MarketSnapshot, direction: str) -> tuple[float, l
     return min(penalty, 30.0), warnings
 
 
-def determine_direction(s: MarketSnapshot) -> str:
+def determine_direction(cfg: Config, s: MarketSnapshot) -> str:
+    """Rejim tabanli yon. BUILDUP rejimleri (hacim teyitli) her zaman
+    islenebilir sinyaldir. WEAK_RALLY/WEAK_DECLINE ("zayif" rejimler --
+    hacim teyidi henuz yok) normalde NEUTRAL sayilir; ANCAK fiyat kanalin
+    ILGILI bandina zaten yakinsa (bandan ilk kalkis isareti olabilir) bunlar
+    da erken/dusuk-teyitli LONG/SHORT tetikleyicisi olarak kabul edilir --
+    boylece hacim teyidi olusana kadar beklemeden, bandan ilk tepki barinda
+    sinyal verilebilir (bkz. Config.EARLY_CHANNEL_ENTRY_ENABLED)."""
     if s.regime == REGIME_ACCUMULATION_BUILDUP:
         return "LONG"
     if s.regime == REGIME_DISTRIBUTION_BUILDUP:
         return "SHORT"
+    if cfg.EARLY_CHANNEL_ENTRY_ENABLED and not math.isnan(s.channel_pos):
+        near_lower = s.channel_pos <= cfg.CHANNEL_EDGE_ZONE
+        near_upper = s.channel_pos >= (1.0 - cfg.CHANNEL_EDGE_ZONE)
+        if s.regime == REGIME_WEAK_RALLY and near_lower:
+            return "LONG"
+        if s.regime == REGIME_WEAK_DECLINE and near_upper:
+            return "SHORT"
     return "NEUTRAL"
 
 
-def compute_sl_tp(cfg: Config, s: MarketSnapshot, direction: str) -> tuple[float, float, float, float]:
+def compute_sl_tp(cfg: Config, s: MarketSnapshot, direction: str,
+                  early: bool = False) -> tuple[float, float, float, float]:
     if direction not in ("LONG", "SHORT") or s.atr_pct <= 0 or s.price <= 0:
         return 0.0, 0.0, 0.0, 0.0
     atr_abs = s.price * (s.atr_pct / 100.0)
-    risk_abs = cfg.ATR_SL_MULT * atr_abs
+    sl_mult = cfg.ATR_SL_MULT_EARLY if early else cfg.ATR_SL_MULT
+    risk_abs = sl_mult * atr_abs
     if risk_abs <= 0:
         return 0.0, 0.0, 0.0, 0.0
     if direction == "LONG":
@@ -872,10 +908,13 @@ def compute_sl_tp(cfg: Config, s: MarketSnapshot, direction: str) -> tuple[float
 
 
 def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
-    direction = determine_direction(s)
+    direction = determine_direction(cfg, s)
+    # "erken" sinyal: WEAK_RALLY/WEAK_DECLINE + banda-yakinlik ile tetiklendi,
+    # hacim teyidi (BUILDUP rejimi) henuz yok -- daha dusuk konviksiyon.
+    early = direction in ("LONG", "SHORT") and s.regime in (REGIME_WEAK_RALLY, REGIME_WEAK_DECLINE)
 
     vr_s, vr_r = score_volume_regime(cfg, s)
-    reg_s, reg_r = score_regime(s)
+    reg_s, reg_r = score_regime(s, direction)
     tak_s, tak_r = score_taker_imbalance(cfg, s, direction)
     volu_s, volu_r = score_volume(s)
     trend_s, trend_r = score_trend(s, direction)
@@ -886,7 +925,7 @@ def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
 
     reasons = reg_r + vr_r + tak_r + volu_r + trend_r
 
-    sl, tp1, tp2, risk_pct = compute_sl_tp(cfg, s, direction)
+    sl, tp1, tp2, risk_pct = compute_sl_tp(cfg, s, direction, early)
 
     if direction == "LONG":
         invalidation = f"Hacim rejimi dususu + EMA20 alti {timeframe} kapanis ({fmt_price(s.ema20)})"
@@ -903,6 +942,7 @@ def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
         reasons=reasons, warnings=risk_w, price=s.price,
         invalidation=invalidation, snap=s,
         stop_loss=sl, take_profit1=tp1, take_profit2=tp2, risk_pct=risk_pct,
+        early=early,
     )
 
 
@@ -946,12 +986,21 @@ def classify_alert(cfg: Config, sig: Signal) -> str:
         return "NONE"
     if sig.direction == "NEUTRAL":
         return "NONE"
-    if s.vol_chg_1 < cfg.VOLUME_SPIKE_WATCH and s.vol_chg_w < cfg.VOLUME_WINDOW_WATCH:
+    # "erken" (WEAK_RALLY/WEAK_DECLINE + banda-yakinlik) sinyaller TANIMI
+    # GEREGI hacim teyidi olmadan tetiklenir; bu yuzden hacim-spike sartini
+    # bunlar icin ARAMIYORUZ (aramasak bile zaten hicbir zaman gecemezlerdi).
+    if not sig.early and s.vol_chg_1 < cfg.VOLUME_SPIKE_WATCH and s.vol_chg_w < cfg.VOLUME_WINDOW_WATCH:
         return "NONE"
     if s.atr_pct < cfg.MIN_ATR_PCT:
         return "NONE"
     if sig.score < cfg.MIN_SCORE_WATCH:
         return "NONE"
+
+    # erken sinyaller dogasi geregi dusuk-teyitlidir -- STRONG olamaz, en
+    # fazla WATCH (kullaniciya "bu bir erken/dusuk-teyit sinyali" mesaji
+    # build_message'daki ⚡ ERKEN etiketiyle zaten iletiliyor).
+    if sig.early:
+        return "WATCH"
 
     vol_strong = (
         (s.vol_chg_1 >= cfg.VOLUME_SPIKE_STRONG and s.vol_rising_streak >= 2)
@@ -1143,12 +1192,15 @@ def build_message(cfg: Config, sig: Signal) -> str:
     zaten ayri foto olarak gidiyor)."""
     s = sig.snap
     tier_emoji = "🚨" if sig.tier == "STRONG" else "👀"
+    early_tag = " ⚡ERKEN" if sig.early else ""
 
     lines = [
         BOT_HEADER,
-        f"{tier_emoji} {sig.tier} | {sig.symbol} | {sig.direction} | {sig.timeframe}",
+        f"{tier_emoji} {sig.tier}{early_tag} | {sig.symbol} | {sig.direction} | {sig.timeframe}",
         f"Skor: {sig.score:.0f}/100 | Fiyat: {fmt_price(s.price)}",
     ]
+    if sig.early:
+        lines.append("⚡ Erken sinyal: hacim teyidi henuz yok, dusuk konviksiyon")
     if not math.isnan(s.channel_pos):
         lines.append(f"Kanal poz: {s.channel_pos * 100:.0f}% (0=alt bant, 100=ust bant)")
     if sig.stop_loss > 0:
@@ -1322,7 +1374,7 @@ class AlertLog:
     def append(self, sig: Signal) -> None:
         self.entries.append({
             "symbol": sig.symbol, "timeframe": sig.timeframe, "direction": sig.direction,
-            "tier": sig.tier, "score": sig.score, "ts": time.time(),
+            "tier": sig.tier, "score": sig.score, "ts": time.time(), "early": sig.early,
         })
         cutoff = time.time() - self.keep_hours * 3600.0
         self.entries = [e for e in self.entries if e.get("ts", 0) >= cutoff]
@@ -1387,8 +1439,9 @@ def build_summary_message(entries: list, hours: float) -> str:
     for e in sorted(entries, key=lambda x: x.get("ts", 0)):
         t = datetime.fromtimestamp(e.get("ts", 0), timezone.utc).strftime("%H:%M")
         tier_emoji = "🚨" if e.get("tier") == "STRONG" else "👀"
+        early_tag = " ⚡" if e.get("early") else ""
         lines.append(
-            f"{tier_emoji} {e.get('symbol')} {e.get('direction')} {e.get('timeframe')} "
+            f"{tier_emoji}{early_tag} {e.get('symbol')} {e.get('direction')} {e.get('timeframe')} "
             f"skor={e.get('score', 0):.0f} | {t} UTC"
         )
     return "\n".join(lines)

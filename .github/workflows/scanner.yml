@@ -47,15 +47,19 @@ jobs:
       - name: Bagimliliklari yukle
         run: pip install -r requirements.txt
 
-      # Cooldown (alarm tekrari onleme) ve sanal performans durumunu
-      # calismalar arasi tasi -> ayni sinyal her turda tekrar tekrar
-      # gonderilmesin, --perf gecmisi birikmeye devam etsin.
-      - name: Onceki durumu geri yukle (cooldown + performans)
+      # Cooldown (alarm tekrari onleme), sanal performans VE alarm gecmisi
+      # (12 saatlik ozet mesaji icin -- last_summary_ts + son alarmlar)
+      # durumunu calismalar arasi tasi -> ayni sinyal her turda tekrar tekrar
+      # gonderilmesin, --perf gecmisi birikmeye devam etsin, ozet mesaji
+      # gercekten trailing 12 saati gorsun ve ayni pencerede (cron her 15
+      # dakikada bir calistigi icin) birden fazla kez gonderilmesin.
+      - name: Onceki durumu geri yukle (cooldown + performans + alarm gecmisi)
         uses: actions/cache@v4
         with:
           path: |
             spot_alerts_cache.json
             spot_virtual_trades.json
+            spot_alert_log.json
           key: spot-scanner-state-${{ github.run_id }}
           restore-keys: |
             spot-scanner-state-

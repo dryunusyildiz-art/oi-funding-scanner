@@ -1502,6 +1502,19 @@ class PerformanceTracker:
         for t in self.trades:
             if t["status"] != "OPEN":
                 continue
+            # Eski (iki kademeli TP1/TP2) formattan kalma acik islemler: bu
+            # dosya kalici oldugu icin kod guncellenmeden ONCE acilmis
+            # islemler hala "tp1"/"tp2"/"stage" anahtarlariyla duruyor
+            # olabilir. Tek-TP formatina tek seferlik gecis yap (crash etmesin).
+            if "tp" not in t:
+                legacy_tp = t.get("tp1") or t.get("tp2")
+                if legacy_tp is None:
+                    continue   # islenemez eski kayit, dokunma
+                t["tp"] = legacy_tp
+                t["r_multiple"] = t.get("tp1_r", self.cfg.ATR_TP1_R)
+                for k in ("tp1", "tp2", "tp1_r", "tp2_r", "stage"):
+                    t.pop(k, None)
+                dirty = True
             price = price_map.get((t["symbol"], t["timeframe"]))
             if price is None:
                 continue
